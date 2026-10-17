@@ -1,0 +1,30 @@
+{
+  "family": "reworkguard-${DEPLOY_ENV}-migrator",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/reworkguard-${DEPLOY_ENV}-ecs-execution",
+  "containerDefinitions": [
+    {
+      "name": "migrator",
+      "image": "${MIGRATOR_IMAGE}",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "secrets": [
+        { "name": "ConnectionStrings__Default", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:reworkguard/${DEPLOY_ENV}/migrations:ConnectionString::" }
+      ],
+      "mountPoints": [{ "sourceVolume": "tmp", "containerPath": "/tmp" }],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/reworkguard/${DEPLOY_ENV}/migrator",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "migrator"
+        }
+      }
+    }
+  ],
+  "volumes": [{ "name": "tmp" }]
+}

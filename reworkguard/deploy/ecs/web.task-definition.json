@@ -1,0 +1,42 @@
+{
+  "family": "reworkguard-${DEPLOY_ENV}-web",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "256",
+  "memory": "512",
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/reworkguard-${DEPLOY_ENV}-ecs-execution",
+  "containerDefinitions": [
+    {
+      "name": "web",
+      "image": "${WEB_IMAGE}",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "user": "101",
+      "portMappings": [{ "containerPort": 8080, "protocol": "tcp", "name": "web" }],
+      "environment": [
+        { "name": "API_UPSTREAM", "value": "${API_UPSTREAM}" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "tmp", "containerPath": "/tmp" },
+        { "sourceVolume": "nginx-conf", "containerPath": "/etc/nginx/conf.d" }
+      ],
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1"],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 10
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/reworkguard/${DEPLOY_ENV}/web",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "web"
+        }
+      }
+    }
+  ],
+  "volumes": [{ "name": "tmp" }, { "name": "nginx-conf" }]
+}

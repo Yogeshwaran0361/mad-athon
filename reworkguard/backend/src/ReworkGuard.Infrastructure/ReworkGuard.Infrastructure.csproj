@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\ReworkGuard.Application\ReworkGuard.Application.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+    <PackageReference Include="Microsoft.EntityFrameworkCore.Relational" />
+    <PackageReference Include="Pomelo.EntityFrameworkCore.MySql" />
+    <PackageReference Include="Microsoft.Extensions.Identity.Core" />
+    <PackageReference Include="Microsoft.AspNetCore.Authentication.JwtBearer" />
+    <PackageReference Include="AWSSDK.SimpleEmailV2" />
+    <PackageReference Include="QuestPDF" />
+    <PackageReference Include="Hangfire.Core" />
+    <PackageReference Include="Hangfire.AspNetCore" />
+    <PackageReference Include="Hangfire.MySqlStorage" />
+    <!-- Hangfire.MySqlStorage allows Newtonsoft.Json 11, which has a High advisory; pin the fixed version. -->
+    <PackageReference Include="Newtonsoft.Json" />
+    <!-- Dapper 1.50 (via Hangfire.MySqlStorage) pulls System.Data.SqlClient 4.4.0 (Moderate advisory); pin the fixed version. -->
+    <PackageReference Include="System.Data.SqlClient" />
+    <PackageReference Include="ClosedXML" />
+  </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="ReworkGuard.Tests" />
+  </ItemGroup>
+</Project>

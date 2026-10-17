@@ -1,0 +1,16 @@
+# .NET
+bin/
+obj/
+*.user
+TestResults/
+# Node
+node_modules/
+dist/
+coverage/
+# Local secrets
+.env
+*.local.json
+# OS / editors
+.DS_Store
+.idea/
+.vscode/

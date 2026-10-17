@@ -1,0 +1,59 @@
+{
+  "family": "reworkguard-${DEPLOY_ENV}-api",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "1024",
+  "memory": "2048",
+  "runtimePlatform": { "operatingSystemFamily": "LINUX", "cpuArchitecture": "X86_64" },
+  "executionRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/reworkguard-${DEPLOY_ENV}-ecs-execution",
+  "taskRoleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/reworkguard-${DEPLOY_ENV}-api-task",
+  "containerDefinitions": [
+    {
+      "name": "api",
+      "image": "${API_IMAGE}",
+      "essential": true,
+      "readonlyRootFilesystem": true,
+      "user": "1654",
+      "portMappings": [{ "containerPort": 8080, "protocol": "tcp", "name": "api" }],
+      "environment": [
+        { "name": "ASPNETCORE_ENVIRONMENT", "value": "Production" },
+        { "name": "Database__MigrateOnStartup", "value": "false" },
+        { "name": "ForwardedHeaders__KnownNetworks__0", "value": "${VPC_CIDR}" },
+        { "name": "Database__SeedOnStartup", "value": "false" },
+        { "name": "DevTools__ClockControl", "value": "false" },
+        { "name": "Email__Provider", "value": "Ses" },
+        { "name": "Email__FromAddress", "value": "${EMAIL_FROM_ADDRESS}" },
+        { "name": "Email__Ses__Region", "value": "${AWS_REGION}" },
+        { "name": "Email__Ses__ConfigurationSetName", "value": "reworkguard-${DEPLOY_ENV}" },
+        { "name": "Notifications__AppBaseUrl", "value": "${APP_BASE_URL}" },
+        { "name": "Cors__AllowedOrigins__0", "value": "${APP_BASE_URL}" },
+        { "name": "Jobs__Enabled", "value": "true" },
+        { "name": "Jobs__RunServer", "value": "true" }
+      ],
+      "secrets": [
+        { "name": "ConnectionStrings__Default", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:reworkguard/${DEPLOY_ENV}/app:ConnectionString::" },
+        { "name": "Jwt__SigningKey", "valueFrom": "arn:aws:secretsmanager:${AWS_REGION}:${AWS_ACCOUNT_ID}:secret:reworkguard/${DEPLOY_ENV}/app:JwtSigningKey::" }
+      ],
+      "mountPoints": [
+        { "sourceVolume": "tmp", "containerPath": "/tmp" },
+        { "sourceVolume": "aspnet", "containerPath": "/home/app/.aspnet" }
+      ],
+      "healthCheck": {
+        "command": ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"],
+        "interval": 15,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 30
+      },
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/reworkguard/${DEPLOY_ENV}/api",
+          "awslogs-region": "${AWS_REGION}",
+          "awslogs-stream-prefix": "api"
+        }
+      }
+    }
+  ],
+  "volumes": [{ "name": "tmp" }, { "name": "aspnet" }]
+}

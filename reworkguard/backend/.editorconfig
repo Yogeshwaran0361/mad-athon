@@ -1,0 +1,31 @@
+root = true
+
+[*.cs]
+indent_style = space
+indent_size = 4
+charset = utf-8
+insert_final_newline = true
+
+# Domain names (Module) are part of the spec; VB keyword clashes are irrelevant here.
+dotnet_diagnostic.CA1716.severity = none
+# ASP.NET Core has no SynchronizationContext.
+dotnet_diagnostic.CA2007.severity = none
+# Exception types are domain-specific and do not need the standard constructor set.
+dotnet_diagnostic.CA1032.severity = none
+# Domain collections are intentionally exposed as read-only interfaces.
+dotnet_diagnostic.CA1002.severity = none
+# Test method names use underscores.
+dotnet_diagnostic.CA1707.severity = none
+
+[**/Migrations/*.cs]
+generated_code = true
+
+[tests/**/*.cs]
+# xUnit's IAsyncLifetime.DisposeAsync owns disposal of per-test resources.
+dotnet_diagnostic.CA1001.severity = none
+# Test names and inline data are not localized.
+dotnet_diagnostic.CA1305.severity = none
+dotnet_diagnostic.CA1307.severity = none
+dotnet_diagnostic.CA1310.severity = none
+# Inline test data arrays are clearer than hoisted fields.
+dotnet_diagnostic.CA1861.severity = none

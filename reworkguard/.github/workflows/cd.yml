@@ -1,0 +1,165 @@
+name: CD
+
+# main -> build, push to ECR, deploy to staging.  Tag v*.*.* -> build, push, deploy to production after a manual
+# approval (configure required reviewers on the `production` environment). AWS access is via GitHub OIDC: no
+# long-lived keys. Repository/environment variables used (Settings > Secrets and variables > Actions > Variables):
+#   AWS_REGION, AWS_ACCOUNT_ID, AWS_DEPLOY_ROLE_ARN (per environment), ECS_CLUSTER, APP_BASE_URL,
+#   EMAIL_FROM_ADDRESS, API_UPSTREAM, SUBNET_IDS, SECURITY_GROUP_IDS, VPC_CIDR.
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-push:
+    name: Build and push images to ECR
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: build
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      registry: ${{ steps.ecr.outputs.registry }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - id: meta
+        name: Image tag
+        run: |
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"; else echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"; fi
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: reworkguard-build-${{ github.run_id }}
+          # The registry host (which contains the account id) is passed to the deploy jobs as a job output;
+          # masked values would be dropped from outputs.
+          mask-aws-account-id: false
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@062b18b96a7aff071d4dc91bc00c4c1a7945b076 # v2.0.1
+      - uses: docker/setup-buildx-action@6524bf65af31da8d45b59e8c27de4bd072b392f5 # v3.8.0
+      - name: API image
+        uses: docker/build-push-action@ca877d9245402d1537745e0e356eab47c3520991 # v6.13.0
+        with:
+          context: backend
+          target: runtime
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.ecr.outputs.registry }}/reworkguard-api:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=api
+          cache-to: type=gha,mode=max,scope=api
+      - name: Migrator image
+        uses: docker/build-push-action@ca877d9245402d1537745e0e356eab47c3520991 # v6.13.0
+        with:
+          context: backend
+          target: migrator
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.ecr.outputs.registry }}/reworkguard-migrator:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=migrator
+          cache-to: type=gha,mode=max,scope=migrator
+      - name: Web image
+        uses: docker/build-push-action@ca877d9245402d1537745e0e356eab47c3520991 # v6.13.0
+        with:
+          context: frontend
+          push: true
+          provenance: true
+          sbom: true
+          tags: ${{ steps.ecr.outputs.registry }}/reworkguard-web:${{ steps.meta.outputs.tag }}
+          cache-from: type=gha,scope=web
+          cache-to: type=gha,mode=max,scope=web
+      - name: Trivy gate on the pushed images
+        run: |
+          for name in api migrator web; do
+            docker pull -q "${{ steps.ecr.outputs.registry }}/reworkguard-$name:${{ steps.meta.outputs.tag }}"
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock aquasec/trivy:0.57.1 image \
+              --exit-code 1 --ignore-unfixed --severity HIGH,CRITICAL --scanners vuln --no-progress \
+              "${{ steps.ecr.outputs.registry }}/reworkguard-$name:${{ steps.meta.outputs.tag }}"
+          done
+
+  deploy-staging:
+    name: Deploy to staging
+    if: github.ref == 'refs/heads/main'
+    needs: build-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: staging
+      url: ${{ vars.APP_BASE_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: reworkguard-staging-${{ github.run_id }}
+      - name: Render task definitions, migrate, roll services
+        env:
+          DEPLOY_ENV: staging
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          APP_BASE_URL: ${{ vars.APP_BASE_URL }}
+          EMAIL_FROM_ADDRESS: ${{ vars.EMAIL_FROM_ADDRESS }}
+          API_UPSTREAM: ${{ vars.API_UPSTREAM }}
+          SUBNET_IDS: ${{ vars.SUBNET_IDS }}
+          SECURITY_GROUP_IDS: ${{ vars.SECURITY_GROUP_IDS }}
+          VPC_CIDR: ${{ vars.VPC_CIDR }}
+          API_IMAGE: ${{ needs.build-push.outputs.registry }}/reworkguard-api:${{ needs.build-push.outputs.tag }}
+          WEB_IMAGE: ${{ needs.build-push.outputs.registry }}/reworkguard-web:${{ needs.build-push.outputs.tag }}
+          MIGRATOR_IMAGE: ${{ needs.build-push.outputs.registry }}/reworkguard-migrator:${{ needs.build-push.outputs.tag }}
+        run: ./deploy/ecs/deploy.sh
+      - name: Smoke test
+        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "${{ vars.APP_BASE_URL }}/health/ready"
+
+  deploy-production:
+    name: Deploy to production (manual approval)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build-push
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    environment:
+      name: production
+      url: ${{ vars.APP_BASE_URL }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: aws-actions/configure-aws-credentials@e3dd6a429d7300a6a4c196c26e071d42e0343502 # v4.0.2
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: reworkguard-production-${{ github.run_id }}
+      - name: Render task definitions, migrate, roll services
+        env:
+          DEPLOY_ENV: production
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          APP_BASE_URL: ${{ vars.APP_BASE_URL }}
+          EMAIL_FROM_ADDRESS: ${{ vars.EMAIL_FROM_ADDRESS }}
+          API_UPSTREAM: ${{ vars.API_UPSTREAM }}
+          SUBNET_IDS: ${{ vars.SUBNET_IDS }}
+          SECURITY_GROUP_IDS: ${{ vars.SECURITY_GROUP_IDS }}
+          VPC_CIDR: ${{ vars.VPC_CIDR }}
+          API_IMAGE: ${{ needs.build-push.outputs.registry }}/reworkguard-api:${{ needs.build-push.outputs.tag }}
+          WEB_IMAGE: ${{ needs.build-push.outputs.registry }}/reworkguard-web:${{ needs.build-push.outputs.tag }}
+          MIGRATOR_IMAGE: ${{ needs.build-push.outputs.registry }}/reworkguard-migrator:${{ needs.build-push.outputs.tag }}
+        run: ./deploy/ecs/deploy.sh
+      - name: Smoke test
+        run: curl -fsS --retry 10 --retry-delay 6 --retry-all-errors "${{ vars.APP_BASE_URL }}/health/ready"

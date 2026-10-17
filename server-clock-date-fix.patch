@@ -1,0 +1,393 @@
+diff --git a/backend/src/ReworkGuard.Api/ApiServiceCollectionExtensions.cs b/backend/src/ReworkGuard.Api/ApiServiceCollectionExtensions.cs
+index aff3d3e..fb1fb31 100644
+--- a/backend/src/ReworkGuard.Api/ApiServiceCollectionExtensions.cs
++++ b/backend/src/ReworkGuard.Api/ApiServiceCollectionExtensions.cs
+@@ -43,7 +43,8 @@ public static class ApiServiceCollectionExtensions
+ 
+         var origins = configuration.GetSection("Cors:AllowedOrigins").Get<string[]>() ?? [];
+         services.AddCors(options => options.AddPolicy(CorsPolicyName, policy =>
+-            policy.WithOrigins(origins).AllowAnyHeader().WithMethods("GET", "POST", "PUT", "DELETE").AllowCredentials()));
++            policy.WithOrigins(origins).AllowAnyHeader().WithMethods("GET", "POST", "PUT", "DELETE").AllowCredentials()
++            .WithExposedHeaders(ServerTimeMiddleware.HeaderName)));
+ 
+         // Slows down password guessing: 10 sign-in or refresh attempts per minute per client address (configurable).
+         var permitLimit = configuration.GetValue("RateLimiting:LoginPermitLimit", 10);
+diff --git a/backend/src/ReworkGuard.Api/Infrastructure/ServerTimeMiddleware.cs b/backend/src/ReworkGuard.Api/Infrastructure/ServerTimeMiddleware.cs
+new file mode 100644
+index 0000000..d7bf35d
+--- /dev/null
++++ b/backend/src/ReworkGuard.Api/Infrastructure/ServerTimeMiddleware.cs
+@@ -0,0 +1,33 @@
++using ReworkGuard.Application.Abstractions;
++
++namespace ReworkGuard.Api.Infrastructure;
++
++/// <summary>
++/// Stamps API responses with the application clock (X-Server-Time, ISO 8601 UTC) so the web app judges "today" by the
++/// same clock the API validates against. It differs from the browser's clock when the development clock is moved.
++/// </summary>
++internal sealed class ServerTimeMiddleware
++{
++    public const string HeaderName = "X-Server-Time";
++
++    private readonly RequestDelegate _next;
++
++    public ServerTimeMiddleware(RequestDelegate next)
++    {
++        _next = next;
++    }
++
++    public Task InvokeAsync(HttpContext context, IClock clock)
++    {
++        if (context.Request.Path.StartsWithSegments("/api"))
++        {
++            context.Response.OnStarting(() =>
++            {
++                context.Response.Headers[HeaderName] = clock.UtcNow.ToString("O");
++                return Task.CompletedTask;
++            });
++        }
++
++        return _next(context);
++    }
++}
+diff --git a/backend/src/ReworkGuard.Api/WebApplicationExtensions.cs b/backend/src/ReworkGuard.Api/WebApplicationExtensions.cs
+index b5e6deb..a25506f 100644
+--- a/backend/src/ReworkGuard.Api/WebApplicationExtensions.cs
++++ b/backend/src/ReworkGuard.Api/WebApplicationExtensions.cs
+@@ -39,6 +39,7 @@ public static class WebApplicationExtensions
+         app.UseForwardedHeaders();
+         app.UseMiddleware<CorrelationIdMiddleware>();
+         app.UseMiddleware<SecurityHeadersMiddleware>();
++        app.UseMiddleware<ServerTimeMiddleware>();
+         app.UseSerilogRequestLogging(options =>
+         {
+             // Path only: query strings can carry tokens (the SignalR hub's access_token).
+diff --git a/frontend/src/api/client.ts b/frontend/src/api/client.ts
+index 6a1db0b..f1f2f3e 100644
+--- a/frontend/src/api/client.ts
++++ b/frontend/src/api/client.ts
+@@ -1,4 +1,7 @@
++import { noteServerTime } from '../forms/dates';
++
+ const TOKEN_KEY = 'reworkguard.token';
++const SERVER_TIME_HEADER = 'X-Server-Time';
+ 
+ /** RFC 7807 problem returned by the API, with optional validation errors and a domain error code. */
+ export class ApiError extends Error {
+@@ -59,7 +62,11 @@ export function refreshAccessToken(): Promise<boolean> {
+ /** Sends a request; on a 401 with a session, refreshes the access token once and retries. */
+ async function send(path: string, init: RequestInit, accept: string): Promise<Response> {
+   const hadToken = tokenStore.get() !== null;
+-  const attempt = () => fetch(`/api/v1${path}`, { ...init, headers: { ...authHeaders(accept), ...(init.headers as Record<string, string> | undefined) } });
++  const attempt = async () => {
++    const result = await fetch(`/api/v1${path}`, { ...init, headers: { ...authHeaders(accept), ...(init.headers as Record<string, string> | undefined) } });
++    noteServerTime(result.headers.get(SERVER_TIME_HEADER));
++    return result;
++  };
+   let response = await attempt();
+   if (response.status === 401 && hadToken && !path.startsWith('/auth/')) {
+     if (await refreshAccessToken()) {
+diff --git a/frontend/src/forms/dates.test.ts b/frontend/src/forms/dates.test.ts
+new file mode 100644
+index 0000000..5284811
+--- /dev/null
++++ b/frontend/src/forms/dates.test.ts
+@@ -0,0 +1,25 @@
++import { afterEach, describe, expect, it, vi } from 'vitest';
++import { noteServerTime, todayUtc } from './dates';
++
++describe('todayUtc', () => {
++  afterEach(() => {
++    noteServerTime(new Date().toISOString());
++    vi.useRealTimers();
++  });
++
++  it('follows the API clock once a server time has been seen', () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date('2026-10-17T03:00:00Z'));
++    noteServerTime('2026-10-22T09:00:00Z');
++    expect(todayUtc()).toBe('2026-10-22');
++  });
++
++  it('ignores a missing or invalid header', () => {
++    vi.useFakeTimers();
++    vi.setSystemTime(new Date('2026-10-17T03:00:00Z'));
++    noteServerTime('2026-10-17T03:00:00Z');
++    noteServerTime(null);
++    noteServerTime('not a date');
++    expect(todayUtc()).toBe('2026-10-17');
++  });
++});
+diff --git a/frontend/src/forms/dates.ts b/frontend/src/forms/dates.ts
+index 0e2a4e1..d8dea4e 100644
+--- a/frontend/src/forms/dates.ts
++++ b/frontend/src/forms/dates.ts
+@@ -1,6 +1,18 @@
+-/** Today's date as yyyy-MM-dd in UTC, matching how the API stores dates. */
++// Difference between the API's clock and the browser's, learned from the X-Server-Time header. The API validates dates
++// against its own clock, which a development clock control can move ahead of the browser's.
++let serverOffsetMs = 0;
++
++/** Records the API clock from an X-Server-Time header value; ignores missing or unparsable values. */
++export function noteServerTime(header: string | null): void {
++  const serverMs = header ? Date.parse(header) : NaN;
++  if (!Number.isNaN(serverMs)) {
++    serverOffsetMs = serverMs - Date.now();
++  }
++}
++
++/** Today's date as yyyy-MM-dd in UTC by the API's clock, matching how the API stores dates. */
+ export function todayUtc(): string {
+-  return new Date().toISOString().slice(0, 10);
++  return new Date(Date.now() + serverOffsetMs).toISOString().slice(0, 10);
+ }
+ 
+ /** The current month as yyyy-MM in UTC. */
+diff --git a/scripts/seed-more-tasks.ps1 b/scripts/seed-more-tasks.ps1
+new file mode 100644
+index 0000000..e56cc10
+--- /dev/null
++++ b/scripts/seed-more-tasks.ps1
+@@ -0,0 +1,169 @@
++<#
++.SYNOPSIS
++  Adds a batch of demo tasks through the public HTTP API so the task list and board look like a working team.
++.DESCRIPTION
++  Creates two more projects (HR Self-Service, Mobile App) with modules, then 20 tasks across them and the existing
++  Customer Portal / Net Banking modules: some just assigned, some in progress with approved hours, some delivered,
++  and two delivered tasks that QA reopens with a bug. Dates follow the server clock. Runs on Windows PowerShell 5.1
++  and PowerShell 7. Needs the demo story (scripts/seed-demo.ps1) first, because Ravi and Meera are assignees.
++  Safe to re-run: projects and tasks that already exist are reused, not duplicated.
++.EXAMPLE
++  powershell -ExecutionPolicy Bypass -File scripts\seed-more-tasks.ps1 -BaseUrl http://localhost:8080
++#>
++param(
++  [string]$BaseUrl = $(if ($env:BASE_URL) { $env:BASE_URL } else { 'http://localhost:8080' }),
++  [string]$SeedPassword = $env:SEED_PASSWORD,
++  [string]$DemoUserPassword = $env:DEMO_USER_PASSWORD
++)
++$ErrorActionPreference = 'Stop'
++Set-StrictMode -Version Latest
++
++$root = Split-Path -Parent $PSScriptRoot
++if (-not $SeedPassword -and (Test-Path "$root/.env")) {
++  $line = Get-Content "$root/.env" | Where-Object { $_ -match '^SEED_PASSWORD=' } | Select-Object -First 1
++  if ($line) { $SeedPassword = $line.Substring('SEED_PASSWORD='.Length).Trim() }
++}
++if (-not $SeedPassword) { throw 'Set SEED_PASSWORD (password of the seeded demo users) or create .env' }
++if (-not $DemoUserPassword) { $DemoUserPassword = "$SeedPassword-Demo2026" }
++
++function Call([string]$token, [string]$method, [string]$path, $body = $null) {
++  $headers = @{ Accept = 'application/json' }
++  if ($token) { $headers.Authorization = "Bearer $token" }
++  $params = @{ Method = $method; Uri = "$BaseUrl$path"; Headers = $headers }
++  if ($null -ne $body) { $params.Body = ($body | ConvertTo-Json -Depth 10 -Compress); $params.ContentType = 'application/json' }
++  try { Invoke-RestMethod @params }
++  catch {
++    $detail = if ($_.ErrorDetails) { $_.ErrorDetails.Message } else { $_.Exception.Message }
++    throw "$method $path failed: $detail"
++  }
++}
++
++# The API allows 10 sign-ins per minute per client address, so wait and retry on HTTP 429.
++function Login([string]$email, [string]$password) {
++  for ($attempt = 1; ; $attempt++) {
++    try {
++      $response = Invoke-RestMethod -Method POST -Uri "$BaseUrl/api/v1/auth/login" -ContentType 'application/json' -Body (@{ email = $email; password = $password } | ConvertTo-Json -Compress)
++      return $response.accessToken
++    }
++    catch {
++      if ($_.Exception.Response -and [int]$_.Exception.Response.StatusCode -eq 429 -and $attempt -lt 8) {
++        Write-Host "  sign-in rate limit reached; retrying $email in 15 s"
++        Start-Sleep -Seconds 15
++        continue
++      }
++      $detail = if ($_.ErrorDetails) { $_.ErrorDetails.Message } else { $_.Exception.Message }
++      throw "Sign-in as $email failed: $detail"
++    }
++  }
++}
++
++$admin = Login 'admin@reworkguard.local' $SeedPassword
++$existing = @((Call $admin GET '/api/v1/tasks?pageSize=100').items)
++
++$employees = (Call $admin GET '/api/v1/admin/employees?pageSize=100').items
++function EmployeeId([string]$email) {
++  $match = $employees | Where-Object { $_.email -eq $email }
++  if (-not $match) { throw "$email not found: run scripts/seed-demo.ps1 first" }
++  $match.id
++}
++$people = @{
++  priya = @{ id = EmployeeId 'priya@reworkguard.local'; token = Login 'priya@reworkguard.local' $SeedPassword }
++  dev   = @{ id = EmployeeId 'dev@reworkguard.local'; token = Login 'dev@reworkguard.local' $SeedPassword }
++  hana  = @{ id = EmployeeId 'hana@reworkguard.local'; token = Login 'hana@reworkguard.local' $SeedPassword }
++  ravi  = @{ id = EmployeeId 'ravi@reworkguard.local'; token = Login 'ravi@reworkguard.local' $DemoUserPassword }
++  meera = @{ id = EmployeeId 'meera@reworkguard.local'; token = Login 'meera@reworkguard.local' $DemoUserPassword }
++}
++$lead = Login 'lead@reworkguard.local' $SeedPassword
++$qa = Login 'qa@reworkguard.local' $SeedPassword
++
++# Dates follow the server's clock (the dev clock may have moved it), in IST (fixed UTC+05:30).
++try { $nowUtc = ([datetime](Call $admin GET '/api/v1/dev/clock').utcNow).ToUniversalTime() } catch { $nowUtc = [datetime]::UtcNow }
++$todayIst = $nowUtc.AddMinutes(330).Date
++function Day([int]$offset) { $todayIst.AddDays($offset).ToString('yyyy-MM-dd') }
++Write-Host "Server today (IST): $(Day 0)"
++
++# There is no project list endpoint, so a project is recognised by its module names (ids are sequential).
++function ProjectModules([string]$name, [int]$warrantyDays, [string[]]$moduleNames) {
++  for ($id = 1; $id -le 100; $id++) {
++    try { $found = @(Invoke-RestMethod -Uri "$BaseUrl/api/v1/admin/projects/$id/modules" -Headers @{ Authorization = "Bearer $admin" }) }
++    catch { break }
++    $found = @($found | ForEach-Object { $_ })  # Windows PowerShell 5.1 hands back a JSON array as one item
++    if (@($found | ForEach-Object { $_.name }) -contains $moduleNames[0]) { return $found }
++  }
++  $project = Call $admin POST '/api/v1/admin/projects' @{ name = $name; warrantyDays = $warrantyDays }
++  Write-Host "Project $name #$($project.projectId)"
++  $moduleNames | ForEach-Object { Call $admin POST "/api/v1/admin/projects/$($project.projectId)/modules" @{ name = $_ } }
++}
++$hrModules = @(ProjectModules 'HR Self-Service' 60 'Leave', 'Attendance', 'Payslip viewer')
++$mobileModules = @(ProjectModules 'Mobile App' 30 'Onboarding', 'Push notifications')
++function ModuleId($list, [string]$name) { ($list | Where-Object { $_.name -eq $name }).id }
++$modules = @{
++  checkout = 1; invoicing = 2; login = 3
++  leave = ModuleId $hrModules 'Leave'
++  attendance = ModuleId $hrModules 'Attendance'
++  payslipViewer = ModuleId $hrModules 'Payslip viewer'
++  onboarding = ModuleId $mobileModules 'Onboarding'
++  notifications = ModuleId $mobileModules 'Push notifications'
++}
++
++# state: Assigned | InProgress | Completed | Bug (completed, then reopened by QA). log = hours per assignee per day.
++$plan = @(
++  @{ module = 'leave'; title = 'Leave: apply and cancel leave'; due = 10; who = 'priya', 'hana'; state = 'InProgress'; log = 3; days = 2 }
++  @{ module = 'leave'; title = 'Leave: balance carry-forward rules'; due = 14; who = 'dev'; state = 'Assigned' }
++  @{ module = 'leave'; title = 'Leave: manager approval inbox'; due = 2; who = 'ravi', 'meera'; state = 'Completed'; log = 2; days = 3 }
++  @{ module = 'attendance'; title = 'Attendance: biometric sync job'; due = 7; who = 'dev'; state = 'InProgress'; log = 4; days = 2 }
++  @{ module = 'attendance'; title = 'Attendance: monthly summary report'; due = 1; who = 'hana'; state = 'Completed'; log = 3; days = 2 }
++  @{ module = 'attendance'; title = 'Attendance: regularisation requests'; due = 18; who = 'priya'; state = 'Assigned' }
++  @{ module = 'payslipViewer'; title = 'Payslip viewer: PDF download'; due = 0; who = 'meera'; state = 'Bug'; log = 3; days = 2; bug = 'PDF shows the previous month for employees who joined mid-month'; severity = 'High' }
++  @{ module = 'payslipViewer'; title = 'Payslip viewer: tax breakup panel'; due = 12; who = 'ravi'; state = 'InProgress'; log = 2; days = 3 }
++  @{ module = 'onboarding'; title = 'Onboarding: welcome carousel'; due = 3; who = 'priya'; state = 'Completed'; log = 2; days = 2 }
++  @{ module = 'onboarding'; title = 'Onboarding: phone number OTP'; due = 9; who = 'ravi', 'dev'; state = 'InProgress'; log = 2; days = 2 }
++  @{ module = 'onboarding'; title = 'Onboarding: profile photo upload'; due = 21; who = 'hana'; state = 'Assigned' }
++  @{ module = 'notifications'; title = 'Push: payment reminder notifications'; due = 1; who = 'dev'; state = 'Bug'; log = 3; days = 2; bug = 'Reminder is sent twice when the app is reinstalled'; severity = 'Medium' }
++  @{ module = 'notifications'; title = 'Push: notification preferences screen'; due = 15; who = 'meera'; state = 'Assigned' }
++  @{ module = 'checkout'; title = 'Checkout: UPI intent payments'; due = 6; who = 'priya', 'meera'; state = 'InProgress'; log = 2; days = 2 }
++  @{ module = 'checkout'; title = 'Checkout: saved cards with tokenisation'; due = 2; who = 'hana'; state = 'Completed'; log = 2; days = 3 }
++  @{ module = 'checkout'; title = 'Checkout: coupon code validation'; due = 20; who = 'dev'; state = 'Assigned' }
++  @{ module = 'invoicing'; title = 'Invoicing: GST e-invoice upload'; due = 8; who = 'hana'; state = 'InProgress'; log = 2; days = 2 }
++  @{ module = 'invoicing'; title = 'Invoicing: credit note generation'; due = 1; who = 'ravi'; state = 'Completed'; log = 3; days = 2 }
++  @{ module = 'login'; title = 'Login: device trust and remember me'; due = 11; who = 'meera'; state = 'InProgress'; log = 2; days = 2 }
++  @{ module = 'login'; title = 'Login: account lockout emails'; due = 25; who = 'priya'; state = 'Assigned' }
++)
++
++# Each person's log days start further back as they get more tasks, so nobody passes the daily-hours limit.
++$nextDay = @{ priya = -12; dev = -12; hana = -12; ravi = -12; meera = -12 }
++$counts = @{ Assigned = 0; InProgress = 0; Completed = 0; Bug = 0 }
++foreach ($t in $plan) {
++  $who = @($t.who)
++  $done = $existing | Where-Object { $_.title -eq $t.title } | Select-Object -First 1
++  # Re-runs skip finished tasks; a task left at Assigned by an interrupted run continues from there.
++  if ($done -and ($t.state -eq 'Assigned' -or $done.status -ne 'Assigned')) {
++    if ($t.state -ne 'Assigned') { $who | ForEach-Object { $nextDay[$_] += 1 } }
++    $counts[$t.state]++
++    continue
++  }
++  $assignees = @($who | ForEach-Object { $people[$_].id })
++  $committed = Day $t.due  # the API refuses a committed date in the past
++  $task = if ($done) { $done } else { Call $lead POST '/api/v1/tasks' @{ moduleId = $modules[$t.module]; title = $t.title; committedDate = $committed; assigneeIds = $assignees } }
++  $owner = $people[$who[0]]
++  if ($t.state -ne 'Assigned') {
++    Call $owner.token POST "/api/v1/tasks/$($task.id)/transitions" @{ targetStatus = 'InProgress'; reason = 'Started' } | Out-Null
++    foreach ($name in $who) {
++      for ($d = 0; $d -lt $t.days; $d++) {
++        $log = Call $people[$name].token POST '/api/v1/timelogs' @{ taskId = $task.id; workDate = (Day ($nextDay[$name] + $d)); hours = $t.log; workType = 'Regular'; bugId = $null; note = $t.title }
++        Call $lead POST "/api/v1/timelogs/$($log.id)/approve" | Out-Null
++      }
++      $nextDay[$name] += 1
++    }
++  }
++  if ($t.state -in 'Completed', 'Bug') {
++    Call $owner.token POST "/api/v1/tasks/$($task.id)/transitions" @{ targetStatus = 'Completed'; reason = 'Delivered to QA' } | Out-Null
++  }
++  if ($t.state -eq 'Bug') {
++    Call $qa POST "/api/v1/tasks/$($task.id)/bugs" @{ severity = $t.severity; description = $t.bug; foundDate = (Day 0) } | Out-Null
++  }
++  $counts[$t.state]++
++  Write-Host ("  #{0} {1} [{2}]" -f $task.id, $t.title, $t.state)
++}
++
++Write-Host ("Demo task batch in place, {0} tasks: {1} assigned, {2} in progress, {3} completed, {4} reopened with a bug." -f $plan.Count, $counts.Assigned, $counts.InProgress, $counts.Completed, $counts.Bug)
+diff --git a/scripts/start-local-windows.ps1 b/scripts/start-local-windows.ps1
+new file mode 100644
+index 0000000..020d6d7
+--- /dev/null
++++ b/scripts/start-local-windows.ps1
+@@ -0,0 +1,66 @@
++﻿# Runs ReworkGuard on Windows without Docker: portable MySQL 8 on port 3307,
++# the API on http://localhost:5081 and the web app on http://localhost:8080.
++# Usage (from the repo root):  powershell -ExecutionPolicy Bypass -File scripts\start-local-windows.ps1
++$ErrorActionPreference = 'Stop'
++$root = Split-Path $PSScriptRoot -Parent
++$mysqlBase = Join-Path $env:USERPROFILE 'reworkguard-mysql'
++$logs = Join-Path $root '.local-logs'
++New-Item -ItemType Directory -Force $logs | Out-Null
++
++$envs = @{}
++Get-Content (Join-Path $root '.env') | Where-Object { $_ -match '^[A-Z_]+=' } | ForEach-Object {
++    $k, $v = $_.Split('=', 2); $envs[$k] = $v.Trim()
++}
++
++function Wait-Port($port, $seconds) {
++    for ($i = 0; $i -lt $seconds; $i++) {
++        if (Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue) { return $true }
++        Start-Sleep 1
++    }
++    return $false
++}
++
++if (-not (Get-NetTCPConnection -LocalPort 3307 -State Listen -ErrorAction SilentlyContinue)) {
++    Start-Process (Join-Path $mysqlBase 'mysql-8.0.46-winx64\bin\mysqld.exe') `
++        -ArgumentList "--defaults-file=`"$mysqlBase\my.ini`"" -WindowStyle Hidden
++    if (-not (Wait-Port 3307 60)) { throw 'MySQL did not start on port 3307' }
++}
++
++if (-not (Get-NetTCPConnection -LocalPort 5081 -State Listen -ErrorAction SilentlyContinue)) {
++    $env:ASPNETCORE_ENVIRONMENT = 'Development'
++    $env:ASPNETCORE_URLS = 'http://localhost:5081'
++    $env:ConnectionStrings__Default = "Server=127.0.0.1;Port=3307;Database=reworkguard;User=reworkguard;Password=$($envs.MYSQL_PASSWORD)"
++    $env:Jwt__SigningKey = $envs.JWT_SIGNING_KEY
++    $env:Database__MigrateOnStartup = 'true'
++    $env:Database__SeedOnStartup = 'true'
++    $env:Database__SeedPassword = $envs.SEED_PASSWORD
++    $env:DevTools__ClockControl = 'true'
++    $env:Email__Provider = 'Log'
++    $env:Notifications__AppBaseUrl = 'http://localhost:8080'
++    $env:Cors__AllowedOrigins__0 = 'http://localhost:8080'
++    # Windows needs ICU (not invariant globalization) to resolve the "Asia/Kolkata" zone Hangfire schedules use.
++    Start-Process dotnet -ArgumentList 'run', '--no-launch-profile', '-p:InvariantGlobalization=false', '--project', "`"$root\backend\src\ReworkGuard.Api`"" `
++        -WindowStyle Hidden -RedirectStandardOutput "$logs\api.log" -RedirectStandardError "$logs\api.err.log"
++    if (-not (Wait-Port 5081 180)) { throw "API did not start; see $logs\api.log" }
++
++    # The development clock resets on every API start. Data entered while it was moved ahead (demo story, tasks
++    # completed "in the future") needs the same lead again, so DEV_CLOCK_OFFSET_HOURS in .env re-applies it.
++    if ($envs.DEV_CLOCK_OFFSET_HOURS) {
++        $login = Invoke-RestMethod -Method Post -Uri 'http://localhost:5081/api/v1/auth/login' -ContentType 'application/json' `
++            -Body (@{ email = 'admin@reworkguard.local'; password = $envs.SEED_PASSWORD } | ConvertTo-Json)
++        $clock = Invoke-RestMethod -Method Post -Uri 'http://localhost:5081/api/v1/dev/clock/advance' -ContentType 'application/json' `
++            -Headers @{ Authorization = "Bearer $($login.accessToken)" } -Body (@{ hours = [double]$envs.DEV_CLOCK_OFFSET_HOURS } | ConvertTo-Json)
++        Write-Host "App clock moved ahead $($envs.DEV_CLOCK_OFFSET_HOURS) h: $($clock.utcNow)"
++    }
++}
++
++if (-not (Get-NetTCPConnection -LocalPort 8080 -State Listen -ErrorAction SilentlyContinue)) {
++    $env:VITE_API_PROXY_TARGET = 'http://localhost:5081'
++    Start-Process cmd -ArgumentList '/c', 'npx', 'vite', '--port', '8080', '--strictPort' `
++        -WorkingDirectory "$root\frontend" -WindowStyle Hidden `
++        -RedirectStandardOutput "$logs\web.log" -RedirectStandardError "$logs\web.err.log"
++    if (-not (Wait-Port 8080 90)) { throw "Web app did not start; see $logs\web.log" }
++}
++
++Write-Host 'ReworkGuard is running: http://localhost:8080'
++

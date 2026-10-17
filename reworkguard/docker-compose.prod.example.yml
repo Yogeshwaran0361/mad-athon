@@ -1,0 +1,102 @@
+# Production-shaped example for a single Docker host (EC2 or similar). ECS Fargate is the documented
+# target (docs/AWS_DEPLOYMENT.md); this file shows the same runtime contract in compose form.
+#
+#   - No MySQL container: the database is Amazon RDS for MySQL 8 (see the parameter group in the docs).
+#   - Email goes through Amazon SES; credentials come from the instance/task IAM role, never from env.
+#   - Secrets are injected as environment variables by the host (e.g. a systemd unit or a wrapper that reads
+#     AWS Secrets Manager:  export DB_CONNECTION_STRING="$(aws secretsmanager get-secret-value \
+#       --secret-id reworkguard/prod/db --query SecretString --output text)"). Nothing secret lives in this file.
+#   - Migrations run as a one-off before rolling out a new version:
+#       docker compose -f docker-compose.prod.example.yml run --rm migrator
+#
+# Usage: copy to docker-compose.prod.yml, set REGISTRY/IMAGE_TAG and the env vars below, then
+#   docker compose -f docker-compose.prod.yml up -d
+name: reworkguard-prod
+
+x-logging: &logging
+  driver: awslogs
+  options:
+    awslogs-region: ${AWS_REGION:?Set AWS_REGION}
+    awslogs-group: /reworkguard/prod
+    awslogs-create-group: "false"
+    tag: "{{.Name}}"
+
+services:
+  migrator:
+    image: ${REGISTRY:?Set REGISTRY}/reworkguard-migrator:${IMAGE_TAG:?Set IMAGE_TAG}
+    profiles: ["migrate"]
+    environment:
+      # A user allowed to run DDL and create triggers (the API's runtime user can be narrower).
+      ConnectionStrings__Default: ${DB_MIGRATIONS_CONNECTION_STRING:?Set DB_MIGRATIONS_CONNECTION_STRING}
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    restart: "no"
+    logging: *logging
+
+  api:
+    image: ${REGISTRY}/reworkguard-api:${IMAGE_TAG}
+    restart: unless-stopped
+    environment:
+      ASPNETCORE_ENVIRONMENT: Production
+      ConnectionStrings__Default: ${DB_CONNECTION_STRING:?Set DB_CONNECTION_STRING (SslMode=Required)}
+      Jwt__SigningKey: ${JWT_SIGNING_KEY:?Set JWT_SIGNING_KEY}
+      Database__MigrateOnStartup: "false"
+      # The ALB/VPC subnet, so client addresses (rate limits, logs) come from X-Forwarded-For.
+      ForwardedHeaders__KnownNetworks__0: "${VPC_CIDR:-10.0.0.0/16}"
+      Database__SeedOnStartup: "false"
+      DevTools__ClockControl: "false"
+      Email__Provider: Ses
+      Email__FromAddress: ${EMAIL_FROM_ADDRESS:?Set EMAIL_FROM_ADDRESS (an SES-verified identity)}
+      Email__Ses__Region: ${AWS_REGION}
+      Email__Ses__ConfigurationSetName: ${SES_CONFIGURATION_SET:-}
+      Notifications__AppBaseUrl: ${APP_BASE_URL:?Set APP_BASE_URL, e.g. https://reworkguard.example.com}
+      Cors__AllowedOrigins__0: ${APP_BASE_URL}
+      Jobs__Enabled: "true"
+      Jobs__RunServer: "true"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m
+      # ASP.NET Core data-protection keys (used by the Hangfire dashboard cookie). Ephemeral per container;
+      # see docs/AWS_DEPLOYMENT.md for persisting them when running several API replicas.
+      - /home/app/.aspnet:size=8m,uid=1654,gid=1654
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 1024M
+        reservations:
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080 && printf 'GET /health HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    logging: *logging
+
+  web:
+    image: ${REGISTRY}/reworkguard-web:${IMAGE_TAG}
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_UPSTREAM: api:8080
+    # TLS terminates at the load balancer in front of this host; only expose 8080 to it.
+    ports:
+      - "8080:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=32m,uid=101,gid=101
+      - /etc/nginx/conf.d:size=1m,uid=101,gid=101
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    logging: *logging
